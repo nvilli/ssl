@@ -1,5 +1,7 @@
 # 2021-09-01 this file is built to train model by self-supervised trainging strategy
 
+# from enum import Flag
+from apex.amp.utils import is_fp_tensor
 from config import ActivityConfig as cfg
 from tools import accuracy, AverageMeter, print_config, parse_args, info_one_step, info_one_epoch, save_config
 from torch import nn, optim
@@ -14,6 +16,7 @@ import random
 import numpy as np
 from apex import amp
 from prefetch_generator import BackgroundGenerator
+import sys
 
 
 def train(train_loader, model, criterion_CE, optimizer, epoch, root_path=None):
@@ -78,14 +81,13 @@ def train(train_loader, model, criterion_CE, optimizer, epoch, root_path=None):
                 total_cls_loss, correct_cnt, total_cls_cnt, correct_cls_cnt = info_one_step(root_path, batch_time,
                                                                                             data_time, losses,
                                                                                             acc, final_result,
-                                                                                            p_label, losses_CE,
+                                                                                            p_label, loss_class,
                                                                                             step, epoch,
                                                                                             len(train_loader),
                                                                                             [optimizer.param_groups[0]['lr'], optimizer.param_groups[-1]['lr']],
                                                                                             total_cls_loss, correct_cnt, total_cls_cnt, correct_cls_cnt)
         # print and save info at one epoch
         info_one_epoch(root_path, total_cls_loss, correct_cnt, total_cls_cnt, correct_cls_cnt, len(train_loader), log_type='train')
-
 
 
 def validation(valid_loader, model, criterion_CE, optimizer, epoch, root_path=None):
@@ -141,7 +143,7 @@ def validation(valid_loader, model, criterion_CE, optimizer, epoch, root_path=No
                     total_cls_loss, correct_cnt, total_cls_cnt, correct_cls_cnt = info_one_step(root_path, batch_time,
                                                                                                 data_time, losses, acc,
                                                                                                 final_result, p_label,
-                                                                                                losses_CE, step, epoch,
+                                                                                                loss_class, step, epoch,
                                                                                                 len(valid_loader),
                                                                                                 [optimizer.param_groups[0]['lr'], optimizer.param_groups[-1]['lr']],
                                                                                                 total_cls_loss, correct_cnt, total_cls_cnt, correct_cls_cnt)
@@ -152,11 +154,14 @@ def validation(valid_loader, model, criterion_CE, optimizer, epoch, root_path=No
     return avg_loss
 
 
-def main():
+def main(id_str, cnt):
     # prepare environment, and show config information
     args = parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
-    cfg.GPUS = args.gpus
+    # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    os.environ["CUDA_VISIBLE_DEVICES"] = id_str
+    cfg.GPUS = cnt
+    cfg.GPU_ID = id_str
+    # cfg.GPUS = args.gpus
     print_config()
 
     # set path to save model and log, and save config parameter as a log file
@@ -205,12 +210,6 @@ def main():
                                           num_workers=cfg.TRAIN.NUM_WORKERS,
                                           drop_last=True)
 
-    # prepare other components, send data and model into CUDA
-    if cfg.MULTI_GPU:
-        model = nn.DataParallel(model)
-    model = model.cuda()
-    criterion_CE = nn.CrossEntropyLoss().cuda()
-
     # set optimizer and scheduler
     model_params = []
     for key, value in dict(model.named_parameters()).items():
@@ -225,9 +224,18 @@ def main():
                                                      patience=cfg.TRAIN.PATIENCE,
                                                      factor=cfg.TRAIN.FACTOR)
 
+    # load model to CUDA
+    model = model.cuda()
+
     # using APEX to accelerate training
     if cfg.APEX:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+
+    # prepare other components, send data and model into CUDA
+    if cfg.MULTI_GPU:
+        model = nn.DataParallel(model)
+    
+    criterion_CE = nn.CrossEntropyLoss().cuda()
 
     # train and validate loop
     prev_best_val_loss = 100
@@ -255,6 +263,93 @@ def main():
             torch.save(model.state_dict(), checkpoints)
             print('===> Checkpoint will be saved to: ', checkpoints)
 
+def gpu_info():
+    gpu_status = os.popen('nvidia-smi | grep %').read().split('|')
+    gpu_memory_info = []
+    for i in range(8):
+        gpu_memory_info.append(gpu_status[i * 4 + 2])
+    return gpu_memory_info
+
+def info_parse(gpu_memory_info):
+    gpu_memory_free = []
+    for i in range(len(gpu_memory_info)):
+        used_memory  = next(i for i, j in enumerate(gpu_memory_info[i].split('/')[0].split(' ')) if j)
+        total_memory = next(i for i, j in enumerate(gpu_memory_info[i].split('/')[1].split(' ')) if j)
+        used_memory  = gpu_memory_info[i].split('/')[0].split(' ')[used_memory].split('MiB')[0]
+        total_memory = gpu_memory_info[i].split('/')[1].split(' ')[total_memory].split('MiB')[0]
+        gpu_memory_free.append(int(total_memory) - int(used_memory))
+    
+    return gpu_memory_free
+
+def check_info(gpu_need, gpu_memory_free):
+
+    info_dict = {}
+    for i in range(len(gpu_memory_free)):
+        info_dict.update({str(gpu_memory_free[i]): i})
+
+    gpu_memory_free.sort(reverse=True)
+    room_free = 0
+    gpu_temp = []
+    gpu_cnt = 0
+    USE_FLAG = False
+    # check whether there is enough room for training
+    for i in range(len(gpu_memory_free)):
+        # check whether there is at least one gpu to use
+        if room_free < gpu_need:
+            if gpu_cnt < 8:
+                room_free += int(gpu_memory_free[i])
+                gpu_temp.append(gpu_memory_free[i])
+                gpu_cnt += 1
+            elif gpu_cnt > 8:
+                break
+        # check whether requirement fulfilled
+        if room_free >= gpu_need:
+            final_flag = len(gpu_temp) - 1
+            if gpu_temp[final_flag] * gpu_cnt >= gpu_need:
+                USE_FLAG = True
+                break
+            elif gpu_temp[final_flag] + gpu_cnt < gpu_need:
+                USE_FLAG = False
+
+    _id = []
+    for i in range(len(gpu_temp)):
+        _id.append(info_dict[str(gpu_temp[i])])
+    
+    return room_free, gpu_temp, gpu_cnt, USE_FLAG, _id
+
+def _watch_gpu(interval = 0.1):
+    t = 0
+    FLAG = True
+    _totalfree = 0
+    _freeid = None
+    cnt = 0
+
+    # argument parse
+    args = parse_args()
+    gpu_need = args.gpus
+
+    while True and FLAG:
+        gpu_memory_info = gpu_info()
+        gpu_memory_free = info_parse(gpu_memory_info)
+        room_free, gpu_temp, gpucnt, useflag, _id = check_info(gpu_need, gpu_memory_free)
+        
+        t = t % 5
+        symbol = '===> Monitoring: ' + '>' * t + ' ' * (5 - t - 1) + ' | '
+        id_str = 'GPU id: ' + str(_id) + ' | '
+        room_str = 'Memory info: ' + str(gpu_temp) + ' | '
+        time_str = 'Time: ' + time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        sys.stdout.write('\r' + symbol + id_str + room_str + time_str)
+        sys.stdout.flush()
+        time.sleep(interval)
+        t += 1
+
+        if useflag == True:
+            _totalfree = room_free
+            _freeid = _id
+            cnt = gpucnt
+            FLAG = False
+
+    return _totalfree, _freeid, cnt
 
 if __name__ == '__main__':
     seed = cfg.RANDOM_SEED
@@ -262,4 +357,21 @@ if __name__ == '__main__':
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    main()
+
+
+    print('-------------------------------------------------------------------------------')
+    print('===> Start time:{}'.format(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())))
+    totalfree, freeid, cnt = _watch_gpu()
+    print("===> Exp will start at: ", time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()))
+    print("===> GPU info: Free memory-", str(totalfree), " GPU id-", str(freeid), " Count-", str(cnt))
+    print('-------------------------------------------------------------------------------')
+
+    id_str = ''
+    freeid.sort()
+    for i in range(len(freeid)):
+        if i == 0:
+            id_str += str(freeid[i])
+        elif i != 0:
+            sub_str = ',' + str(freeid[i])
+            id_str += sub_str
+    main(id_str, cnt)

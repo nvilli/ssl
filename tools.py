@@ -86,7 +86,7 @@ def info_one_step(save_path, batch_time, data_time,
     s_str = str(p_str) + '\n'
     file.write(str(s_str))
 
-    p_str = "===> Epoch:[{0}][{1}/{2}]".format(epoch, step + 1, len(loader_len))
+    p_str = "===> Epoch:[{0}][{1}/{2}]".format(epoch, step + 1, loader_len)
     print(p_str)
     s_str = str(p_str) + '\n'
     file.write(str(s_str))
